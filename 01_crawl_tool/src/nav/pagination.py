@@ -23,6 +23,45 @@ except ImportError:  # pragma: no cover
     from scraper import api_client  # type: ignore
 
 
+_ROW_SELECTOR = "tbody.ant-table-tbody tr.ant-table-row"
+_STALE_POLL_INTERVAL = 0.15   # seconds between DOM checks
+_STABLE_REQUIRED = 3          # consecutive identical snapshots = stable
+_WAIT_TIMEOUT = 30            # seconds before giving up
+
+
+def _wait_rows_stable(driver, timeout_s=_WAIT_TIMEOUT):
+    """Wait until the result table rows stop changing (DOM stable).
+
+    Polls every _STALE_POLL_INTERVAL seconds. Returns True when the same
+    set of row element IDs is observed _STABLE_REQUIRED times in a row.
+    Returns False on timeout. Replaces all fixed time.sleep() calls after
+    pagination navigation.
+    """
+    deadline = time.monotonic() + timeout_s
+    prev_snapshot = None
+    streak = 0
+
+    while time.monotonic() < deadline:
+        try:
+            rows = driver.find_elements(By.CSS_SELECTOR, _ROW_SELECTOR)
+            snapshot = tuple(r.id for r in rows if r.id)
+        except Exception:
+            time.sleep(_STALE_POLL_INTERVAL)
+            continue
+
+        if snapshot and snapshot == prev_snapshot:
+            streak += 1
+            if streak >= _STABLE_REQUIRED:
+                return True
+        else:
+            streak = 0
+
+        prev_snapshot = snapshot
+        time.sleep(_STALE_POLL_INTERVAL)
+
+    return False
+
+
 def get_ui_pagination_progress(driver):
     """Return `(current_page, last_page, pct)` or `(None, None, None)`.
 
@@ -108,9 +147,8 @@ def go_to_page(driver, wait, page_target):
                 current = active.get_attribute("title") or active.text
                 if str(current) == str(page_target):
                     log(f"✅ Successfully jumped to page {page_target}", "SUCCESS")
-                    time.sleep(2.0)
-                    api_client.wait_for_loading_overlay(driver, timeout=30)
-                    time.sleep(3.5)
+                    if not _wait_rows_stable(driver):
+                        log("go_to_page: rows did not stabilise — continuing anyway", "WARNING")
                     return True
             except Exception:
                 pass
@@ -139,9 +177,8 @@ def go_to_next_page(driver, wait, is_recovery=False, max_retries=3):
                 driver.execute_script("arguments[0].click();", next_btn)
             else:
                 human_click(driver, next_btn)
-            time.sleep(2.0)
-            api_client.wait_for_loading_overlay(driver, timeout=30)
-            time.sleep(3.5)
+            if not _wait_rows_stable(driver):
+                log("go_to_next_page: rows did not stabilise — continuing anyway", "WARNING")
             return True
         except Exception as e:
             if attempt < max_retries - 1:
