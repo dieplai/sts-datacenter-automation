@@ -1,0 +1,11 @@
+pandas
+numpy
+selenium
+undetected-chromedriver
+beautifulsoup4
+openpyxl
+setuptools
+pysocks
+requests
+httpx[http2]
+h2

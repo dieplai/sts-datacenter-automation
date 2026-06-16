@@ -1,0 +1,50 @@
+"""Local overrides — TEMPLATE for Multi-Server Deployment.
+
+HƯỚNG DẪN: Đổi tên file này thành _local.py trước khi chạy.
+"""
+import os
+
+USERNAME = os.environ.get("W52_USERNAME", "vtic.stsgroup@gmail.com")
+PASSWORD = os.environ.get("W52_PASSWORD", "Vtic@2024!")
+TARGET_URL = "https://pro.52wmb.com"
+PRO_LOGIN_URL = "https://pro.52wmb.com/user/login?redirect=%2FWorkbenches"
+
+PROXY_HOST = ""
+PROXY_PORT = ""
+PROXY_USER = ""
+PROXY_PASS = ""
+
+TEST_MODE = False
+DETAIL_COUNTRY = "Vietnam"
+DETAIL_SUBMODE = "multi"
+
+# ============================================================================
+# CẤU HÌNH BATCH JOB BÊN DƯỚI DÀNH CHO MÁY 1 - ACCOUNT 1 (VÍ DỤ)
+# BẠN CẦN SỬA ĐOẠN NÀY CHO TỪNG ACCOUNT ĐỂ TRÁNH CHẠY TRÙNG NHAU.
+# ============================================================================
+TRANSACTIONS_BATCH = [
+    # Vá lỗi Quý 1
+    {'name': '54_Import_Q1', 'hs_code': '54', 'data_type': 'Import data', 'start_date': '2026-02-01', 'end_date': '2026-03-31', 'buyer': '', 'expected': 0},
+    {'name': '60_Import_Q1', 'hs_code': '60', 'data_type': 'Import data', 'start_date': '2026-01-01', 'end_date': '2026-03-31', 'buyer': '', 'expected': 0},
+    
+    # Cào Tháng 4
+    {'name': '52_Import_T4', 'hs_code': '52', 'data_type': 'Import data', 'start_date': '2026-04-01', 'end_date': '2026-04-30', 'buyer': '', 'expected': 0},
+    {'name': '53_Import_T4', 'hs_code': '53', 'data_type': 'Import data', 'start_date': '2026-04-01', 'end_date': '2026-04-30', 'buyer': '', 'expected': 0},
+    {'name': '54_Import_T4', 'hs_code': '54', 'data_type': 'Import data', 'start_date': '2026-04-01', 'end_date': '2026-04-30', 'buyer': '', 'expected': 0},
+    {'name': '55_Import_T4', 'hs_code': '55', 'data_type': 'Import data', 'start_date': '2026-04-01', 'end_date': '2026-04-30', 'buyer': '', 'expected': 0},
+]
+
+INTERMEDIATE_FORMAT = "csv"
+DETAIL_MAX_PAGES = None # Không giới hạn trang
+
+FAST_API_MODE = True
+FAST_API_CONCURRENCY = 5
+FAST_API_RATE_LIMIT = 20
+FAST_API_RETRIES = 3
+FAST_API_FALLBACK_THRESHOLD = 3
+FAST_API_USE_PROXY = True
+
+PROXY_ROTATION_ENABLED = True
+PROXY_ROTATION_INTERVAL_PAGES = 10
+PROXY_COOLDOWN_ON_BLOCK_SEC = 45
+PROXY_ROTATE_ON_407 = True

@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+venv/
+output/
+data/
+html_debug/
+plugin/
+chromedriver.exe
+chromedriver/
+.env
+src/config.py
+src/config.py.bak
+src/config/_local.py
+tools/captures/
+tools/benchmark_result_*.json
+logs/
+typescript
+# Google service account credentials (do NOT commit)
+credentials/
+*sa-etl*.json
+*service-account*.json
+.chrome_tmp/
