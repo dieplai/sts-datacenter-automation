@@ -4,11 +4,11 @@ Scrapes transaction details from Market Analysis > Customs Data page
 Uses checkpoint system like legacy mode with segment/page/stt tracking
 """
 
-import re
 import time
 import json
 import os
 import csv
+import threading
 import pandas as pd
 from datetime import datetime, timedelta
 from selenium.webdriver.common.by import By
@@ -19,39 +19,62 @@ import subprocess
 import undetected_chromedriver as uc
 from selenium import webdriver
 
-from ..observability import log, Timer, SessionExpired, ApiError, RateMeter
-from ..utils import human_click, random_sleep
-from . import api_client, navigator_pro
-from ..extract import http_fetcher as _http_client_mod
-from ..extract import DetailCapture
-from ..extract.async_fetcher import fetch_many
-from ..parsing import (
-    FIELD_MAPPING as _PARSING_FIELD_MAPPING,
-    ALIASES as _PARSING_ALIASES,
-    update_mapping_from_server as _parsing_update_mapping,
-    extract_transaction_date as _parsing_extract_date,
-    get_transaction_id as _parsing_get_tx_id,
-)
-from ..storage import (
-    generate_output_filename as _storage_generate_filename,
-    detect_resume_point as _storage_detect_resume,
-    CsvSink,
-    convert_to_excel as _storage_convert_to_excel,
-)
-from ..nav import pagination as _nav_pagination
-from .. import config
+try:
+    from ..observability import log, Timer, SessionExpired, ApiError, RateMeter
+    from ..utils import human_click, random_sleep
+    from . import api_client, navigator_pro
+    from ..extract import http_fetcher as _http_client_mod
+    from ..extract import DetailCapture
+    from ..extract.async_fetcher import fetch_many
+    from ..parsing import (
+        FIELD_MAPPING as _PARSING_FIELD_MAPPING,
+        ALIASES as _PARSING_ALIASES,
+        update_mapping_from_server as _parsing_update_mapping,
+        extract_transaction_date as _parsing_extract_date,
+        get_transaction_id as _parsing_get_tx_id,
+    )
+    from ..storage import (
+        generate_output_filename as _storage_generate_filename,
+        detect_resume_point as _storage_detect_resume,
+        CsvSink,
+        convert_to_excel as _storage_convert_to_excel,
+    )
+    from ..nav import pagination as _nav_pagination
+    from .. import config
+except ImportError:
+    import sys
+    sys.path.append('..')
+    from src.observability import log, Timer, SessionExpired, ApiError, RateMeter
+    from src.utils import human_click, random_sleep
+    from src.scraper import api_client, navigator_pro
+    from src.extract import http_fetcher as _http_client_mod
+    from src.extract import DetailCapture
+    from src.extract.async_fetcher import fetch_many
+    from src.parsing import (
+        FIELD_MAPPING as _PARSING_FIELD_MAPPING,
+        ALIASES as _PARSING_ALIASES,
+        update_mapping_from_server as _parsing_update_mapping,
+        extract_transaction_date as _parsing_extract_date,
+        get_transaction_id as _parsing_get_tx_id,
+    )
+    from src.storage import (
+        generate_output_filename as _storage_generate_filename,
+        detect_resume_point as _storage_detect_resume,
+        CsvSink,
+        convert_to_excel as _storage_convert_to_excel,
+    )
+    from src.nav import pagination as _nav_pagination
+    from src import config
 
 def force_kill_chrome():
     try:
-        result = subprocess.run(
-            ['taskkill', '/F', '/IM', 'chromedriver.exe', '/T'],
-            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        log(f"force_kill_chrome: rc={result.returncode}", "DEBUG")
-    except Exception:
+        # Tắt ép buộc mọi tiến trình chromedriver trên hệ thống để chặn kẹt RAM
+        subprocess.run(['taskkill', '/F', '/IM', 'chromedriver.exe', '/T'], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    except:
         pass
 
 
-_FILTER_PUNCT_RE = re.compile(r'[\-_./,;:()\[\]\\/]+')
+_FILTER_PUNCT_RE = None  # lazy-init
 
 
 def _hs_prefix_matches(expected_hs, actual_hs):
@@ -88,6 +111,10 @@ def _tokenize_for_filter(s):
     comma/semicolon/colon/underscore/slash/parens vì 52WMB data có thể
     join hoặc tách các token này tùy nguồn (list vs detail endpoint).
     """
+    global _FILTER_PUNCT_RE
+    if _FILTER_PUNCT_RE is None:
+        import re as _re
+        _FILTER_PUNCT_RE = _re.compile(r'[\-_./,;:()\[\]\\/]+')
     s = ' '.join(str(s or '').lower().split())
     s = _FILTER_PUNCT_RE.sub(' ', s)
     return s.split()
@@ -430,8 +457,11 @@ class ScraperProDetail:
                         log("🛑 SAFETY CHECK: Found 0 records.", "ERROR")
                         setup_success = False
 
-                    elif strict_validation and effective_expected and total_records > (effective_expected * 2):
-                        log(f"⚠️ SAFETY CHECK FAILED: Mismatch Detected! Expected {effective_expected}, Found {total_records}", "WARNING")
+                    elif strict_validation and effective_expected and (
+                        total_records > (effective_expected * 2) or
+                        total_records < (effective_expected * 0.5)
+                    ):
+                        log(f"⚠️ SAFETY CHECK FAILED: Mismatch Detected! Expected {effective_expected:,}, Found {total_records:,}", "WARNING")
                         setup_success = False
 
             if setup_success:
@@ -566,6 +596,8 @@ class ScraperProDetail:
                         f"page {self.current_page}: scraped {segment_scraped:,} "
                         f"≥ {total_records:,} − tolerance {NEAR_END_TOLERANCE}. "
                         f"Triggering segment shift.", "SUCCESS")
+                    self._auto_upload_to_drive(
+                        f"after segment {self.current_segment} (natural end at page {self.current_page})")
                     # Force segment-shift logic by jumping to MAX_PAGES_PER_SEGMENT
                     # so the existing shift-trigger block at the bottom of this
                     # loop fires. Cleaner than copy-pasting shift logic here.
@@ -645,6 +677,11 @@ class ScraperProDetail:
                                             f"after recovery — treating as end-of-segment "
                                             f"and forcing segment shift instead of "
                                             f"crashing.", "WARNING")
+                                        self._auto_upload_to_drive(
+                                            f"after segment {self.current_segment} "
+                                            f"(forced shift at page {self.current_page} "
+                                            f"after {SKIP_PROBE_LIMIT} consecutive empty "
+                                            f"probes)")
                                         self.current_page = self.MAX_PAGES_PER_SEGMENT
                                         page_transactions = []
                                         is_api_bug_boundary = True
@@ -786,7 +823,14 @@ class ScraperProDetail:
                     
                     # Save to CSV after whole page is done
                     self.append_to_csv(page_transactions)
-                    
+                    self._write_status(
+                        self.current_page,
+                        self.total_scraped,
+                        self.current_segment,
+                        None,
+                        self.segment_end_date,
+                    )
+
                     # ============================================================
                     # SEGMENT SHIFT CHECK: At page 333, trigger segment shift
                     # ============================================================
@@ -809,6 +853,14 @@ class ScraperProDetail:
                         if boundary_date:
                             log(f"📍 Segment {self.current_segment} complete. Got {self.MAX_PAGES_PER_SEGMENT * self.ROWS_PER_PAGE} records.", "SUCCESS")
                             log(f"📍 New segment end date: {boundary_date}", "INFO")
+
+                            # ===== Auto-upload after segment complete =====
+                            # User wants the CSV pushed to Drive at every
+                            # segment boundary, not just on final exit.
+                            # Sleep ~1s to let the CSV writer flush, then
+                            # upload (best-effort; never raises).
+                            self._auto_upload_to_drive(
+                                f"after segment {self.current_segment}")
 
                             # Update state for new segment
                             self.segment_end_date = boundary_date
@@ -1127,8 +1179,11 @@ class ScraperProDetail:
                         log(f"🏁 Segment {self.current_segment} naturally "
                             f"complete: {segment_scraped:,}/{total_records:,} "
                             f"(within tolerance, Next button gone).", "SUCCESS")
+                        self._auto_upload_to_drive(
+                            f"after segment {self.current_segment} (natural end)")
                     else:
                         log("🏁 No more next button - end of data.", "INFO")
+                        self._auto_upload_to_drive("at end of data")
                     break
                 
                 self.current_page += 1
@@ -1145,22 +1200,20 @@ class ScraperProDetail:
             log(f"{'='*60}\n", "SUCCESS")
             
             # Transaction pipeline complete
-            if getattr(config, 'SAVE_EXCEL', False):
-                self.convert_to_excel()
+            self.convert_to_excel()
             return True
         except KeyboardInterrupt:
             log("\n🛑 Scraping interrupted by user. Saving progress...", "WARNING")
-            if getattr(config, 'SAVE_EXCEL', False):
-                self.convert_to_excel()
+            self.convert_to_excel()
             # Re-raise to let outer loop handle graceful exit (don't retry)
             raise
         except Exception as e:
             log(f"❌ Scraping failed: {e}", "ERROR")
-            if getattr(config, 'SAVE_EXCEL', False):
-                try:
-                    self.convert_to_excel()
-                except:
-                    pass
+            # Ensure we still try to save what we have
+            try:
+                self.convert_to_excel()
+            except:
+                pass
             import traceback
             traceback.print_exc()
             return False
@@ -1240,6 +1293,147 @@ class ScraperProDetail:
             log(f"🌐 network probe FAILED: pro.52wmb.com:443 unreachable: "
                 f"{e}", "WARNING")
             return False
+
+    def _auto_upload_to_drive(self, reason=""):
+        """Spawn cumulative + per-segment Drive upload in a daemon thread
+        so the scrape loop NEVER blocks on upload.
+
+        Why background: 2026-05-05 incident — Drive resumable upload of a
+        50MB xlsx hung for >1h, blocking the scraper thread because the
+        upload was synchronous. User had to Ctrl+C and restart, losing
+        ~1h of potential scrape time. Now upload is fire-and-forget;
+        worst case the thread hangs forever (daemon, dies with process)
+        and the scraper keeps moving.
+
+        Concurrency: only one upload thread at a time. If the previous
+        upload is still alive when this fires (e.g., last segment's
+        upload still uploading and segment N+1 just finished), this call
+        is skipped — the next segment boundary will trigger a fresh
+        upload that includes the missed segment's data (cumulative is a
+        full snapshot anyway).
+
+        Best-effort — any failure inside the thread is logged but never
+        propagated.
+        """
+        prev = getattr(self, '_upload_thread', None)
+        if prev is not None and prev.is_alive():
+            log(f"⏭️ Previous Drive upload still running — skipping this "
+                f"trigger ({reason}); next segment will re-trigger",
+                "WARNING")
+            return
+
+        csv_path = self.csv_file
+        seg_num = self.current_segment
+
+        def _bg_upload():
+            try:
+                time.sleep(1)  # let CSV writer flush
+                log(f"📤 [bg] Auto-uploading to Drive ({reason})...",
+                    "PROCESS")
+                from pathlib import Path as _P
+                import sys as _sys
+                scripts_dir = _P(csv_path).resolve().parent.parent / "scripts"
+                if str(scripts_dir) not in _sys.path:
+                    _sys.path.insert(0, str(scripts_dir))
+                try:
+                    import upload_to_drive as _u
+                    _u.upload_latest(csv_path=csv_path)
+                except Exception as e:
+                    log(f"⚠️ [bg] Drive cumulative upload skipped: {e}",
+                        "WARNING")
+                try:
+                    self._upload_segment_slice(seg_num)
+                except Exception as e:
+                    log(f"⚠️ [bg] Segment slice failed: {e}", "WARNING")
+                log(f"✅ [bg] Drive upload finished ({reason})", "SUCCESS")
+            except Exception as e:
+                log(f"⚠️ [bg] Drive upload outer error: {e}", "WARNING")
+
+        t = threading.Thread(
+            target=_bg_upload, daemon=True, name="drive-upload")
+        t.start()
+        self._upload_thread = t
+        log(f"📤 Drive upload spawned in background ({reason}) — "
+            f"scraper continues without waiting", "INFO")
+
+    def _upload_segment_slice(self, segment_num):
+        """Slice the cumulative CSV by `segment == N`, write an
+        immutable per-segment file to output/segments/, and upload it
+        to Drive under hs<code>/segments/.
+
+        Filename: <cumulative_stem>_seg<N>_<dateMin>_to_<dateMax>.csv
+        (date range derived from this segment's actual rows, not config
+        — handles cases where segment ends mid-day).
+        """
+        from pathlib import Path as _P
+        import sys as _sys
+        try:
+            import pandas as _pd
+        except ImportError:
+            log("⚠️ pandas not available — skipping segment slice", "WARNING")
+            return
+
+        cum_csv = _P(self.csv_file)
+        if not cum_csv.is_file():
+            log(f"⚠️ Slice skipped: cumulative CSV missing: {cum_csv}",
+                "WARNING")
+            return
+
+        try:
+            df = _pd.read_csv(cum_csv, low_memory=False, dtype=str)
+        except Exception as e:
+            log(f"⚠️ Slice skipped: cannot read cumulative CSV: {e}",
+                "WARNING")
+            return
+
+        if "segment" not in df.columns:
+            log("⚠️ Slice skipped: 'segment' column missing in CSV",
+                "WARNING")
+            return
+
+        seg_mask = df["segment"].astype(str).str.strip() == str(segment_num)
+        seg_df = df[seg_mask]
+        if seg_df.empty:
+            log(f"⚠️ Slice skipped: segment {segment_num} has 0 rows in CSV",
+                "WARNING")
+            return
+
+        # Date range from this segment's rows (not config) — segments may
+        # end mid-day if the previous segment's last row dictated the
+        # boundary, so config dates won't always match actual coverage.
+        date_col = "Transaction Date"
+        if date_col not in seg_df.columns:
+            log(f"⚠️ Slice skipped: '{date_col}' column missing", "WARNING")
+            return
+        dates = seg_df[date_col].dropna().astype(str).str.strip()
+        dates = dates[dates != ""]
+        if dates.empty:
+            log(f"⚠️ Slice skipped: segment {segment_num} has no dates",
+                "WARNING")
+            return
+        date_min, date_max = dates.min(), dates.max()
+
+        slice_dir = cum_csv.parent / "segments"
+        slice_dir.mkdir(parents=True, exist_ok=True)
+        slice_name = (f"{cum_csv.stem}_seg{segment_num}_"
+                      f"{date_min}_to_{date_max}.csv")
+        slice_path = slice_dir / slice_name
+        try:
+            seg_df.to_csv(slice_path, index=False)
+        except Exception as e:
+            log(f"⚠️ Slice write failed: {e}", "WARNING")
+            return
+        log(f"📑 Segment slice: {slice_name} ({len(seg_df):,} rows, "
+            f"{date_min} → {date_max})", "SUCCESS")
+
+        scripts_dir = cum_csv.resolve().parent.parent / "scripts"
+        if str(scripts_dir) not in _sys.path:
+            _sys.path.insert(0, str(scripts_dir))
+        try:
+            import upload_to_drive as _u
+            _u.upload_segment_slice(slice_path)
+        except Exception as e:
+            log(f"⚠️ Slice upload skipped: {e}", "WARNING")
 
     def _ensure_http_client(self):
         """Lazily build ProHttpClient from the current Selenium cookies."""
@@ -2098,6 +2292,8 @@ class ScraperProDetail:
                     row_idx += 1
             
             return transactions
+        except ValueError:
+            raise
         except Exception as e:
             log(f"❌ Error scraping page {page_num}: {e}", "ERROR")
             return []
@@ -2990,6 +3186,133 @@ class ScraperProDetail:
         """Delegate to src.storage.excel_sink.convert_to_excel."""
         _storage_convert_to_excel(self.csv_file, self.excel_file)
 
+    def _write_status(self, page_num, total_scraped, segment_num, segment_start, segment_end, extra=None):
+        """Write live progress to data/status.json for the management tool to poll."""
+        import json as _json
+        status = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "account": getattr(config, "USERNAME", "unknown"),
+            "batch": getattr(self, "batch_name", ""),
+            "segment": segment_num,
+            "segment_start": str(segment_start),
+            "segment_end": str(segment_end),
+            "page": page_num,
+            "total_scraped": total_scraped,
+            "state": "running",
+        }
+        if extra:
+            status.update(extra)
+        try:
+            base_dir = os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            )
+            status_path = os.path.join(base_dir, "data", "status.json")
+            os.makedirs(os.path.dirname(status_path), exist_ok=True)
+            with open(status_path, "w", encoding="utf-8") as _f:
+                _json.dump(status, _f, ensure_ascii=False)
+        except Exception:
+            pass  # status.json is best-effort — never crash crawl for it
+
+    _SEGMENT_VERIFY_THRESHOLD = 0.95
+
+    def _verify_segment(self, segment_num, segment_start, segment_end, expected):
+        """Count CSV rows in date range and compare to website total.
+
+        Returns True if count >= 95% of expected. Logs WARNING if below.
+        Never raises — verification is best-effort and must not abort crawl.
+        """
+        if not expected or expected <= 0 or expected >= 900000:
+            return True  # no usable baseline (0, unknown, or sentinel 999999)
+        try:
+            import csv as _csv
+            count = 0
+            seg_start_str = str(segment_start)
+            seg_end_str = str(segment_end)
+            with open(self.csv_file, encoding="utf-8", newline="") as _fh:
+                reader = _csv.DictReader(_fh)
+                date_col = next(
+                    (c for c in (reader.fieldnames or []) if "ngay" in c.lower() or "date" in c.lower()),
+                    None,
+                )
+                if not date_col:
+                    return True
+                for row in reader:
+                    val = row.get(date_col, "")
+                    if seg_start_str <= val <= seg_end_str:
+                        count += 1
+        except Exception as ex:
+            log(f"Segment verify: could not count CSV rows: {ex}", "WARNING")
+            return True
+        ratio = count / expected
+        if ratio < self._SEGMENT_VERIFY_THRESHOLD:
+            log(
+                f"SEGMENT VERIFY FAILED: seg {segment_num} "
+                f"({segment_start} to {segment_end}) "
+                f"got {count:,}/{expected:,} rows ({ratio:.1%}) — below 95%",
+                "WARNING",
+            )
+            return False
+        log(
+            f"Segment verify OK: {count:,}/{expected:,} rows ({ratio:.1%})",
+            "INFO",
+        )
+        return True
+
+    _RETRY_BACKOFF = [5, 15, 45]
+
+    def _retry_failed_rows(self):
+        """Retry JSONL entries from data/failed/ with exponential backoff.
+
+        Overwrites the JSONL file with only the entries that still failed.
+        """
+        import glob as _glob
+        import json as _json
+        import time as _time
+        try:
+            base_dir = os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            )
+            failed_dir = os.path.join(base_dir, "data", "failed")
+            if not os.path.isdir(failed_dir):
+                return
+            for fpath in _glob.glob(os.path.join(failed_dir, "failed_rows_*.jsonl")):
+                try:
+                    with open(fpath, encoding="utf-8") as _fh:
+                        entries = [_json.loads(line) for line in _fh if line.strip()]
+                except Exception:
+                    continue
+                if not entries:
+                    continue
+                log(f"Retrying {len(entries)} failed rows from {os.path.basename(fpath)}", "INFO")
+                still_failed = []
+                for entry in entries:
+                    success = False
+                    for delay in self._RETRY_BACKOFF:
+                        try:
+                            # _fetch_one_detail is the method that fetches a single row detail.
+                            # Adjust the method name to match what exists in this class.
+                            if hasattr(self, '_fetch_one_detail'):
+                                result = self._fetch_one_detail(entry)
+                            elif hasattr(self, 'fetch_detail'):
+                                result = self.fetch_detail(entry)
+                            else:
+                                result = None
+                            if result:
+                                success = True
+                                break
+                        except Exception as _ex:
+                            log(f"Retry attempt failed: {_ex}", "WARNING")
+                        _time.sleep(delay)
+                    if not success:
+                        still_failed.append(entry)
+                with open(fpath, "w", encoding="utf-8") as _fh:
+                    for e in still_failed:
+                        _fh.write(_json.dumps(e, ensure_ascii=False) + "\n")
+                recovered = len(entries) - len(still_failed)
+                log(f"Retry result: {recovered}/{len(entries)} recovered", "INFO")
+        except Exception as _ex:
+            log(f"_retry_failed_rows error: {_ex}", "WARNING")
+
 
 def _wait_for_login_outcome(driver, timeout=30, poll_interval=2):
     """Fast-poll the login result. Replaces a single 60s
@@ -3656,7 +3979,7 @@ def main_pro_detail_multi():
                                 log("✅ Deep recovery successful", "SUCCESS")
                             else:
                                 log("❌ Deep recovery failed, skipping item", "ERROR")
-                                failed_items.append(item_name)
+                                failed_items += 1
                                 continue
                         except Exception as recovery_error:
                             log(f"❌ Recovery error: {recovery_error}", "ERROR")
