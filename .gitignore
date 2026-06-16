@@ -18,3 +18,10 @@ Thumbs.db
 _crawl_review/
 tools/crawl-manager/bin/
 tools/crawl-manager/vendor/
+.claude/
+pipeline_test_report.txt
+diag_*.py
+fix_smb_auth.py
+check_shares.py
+check_chrome_vers.py
+read_remote_log.py

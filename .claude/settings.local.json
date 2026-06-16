@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(rclone *)",
-      "PowerShell(& \"D:\\\\datacenter\\\\tools\\\\rclone.exe\" config reconnect gdrive:)"
-    ]
-  },
-  "enabledPlugins": {}
-}
